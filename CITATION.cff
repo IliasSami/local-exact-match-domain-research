@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this skill in research or commercial work, please cite it."
+title: "Local Exact-Match Domain Research Skill"
+abstract: "EMD/PMD/brandable domain research, validation, scoring, and live RDAP availability checks for legitimate local-business SEO and lead generation, packaged as a reusable AI-agent skill."
+type: software
+authors:
+  - family-names: Ahmed
+    given-names: Ilias
+license: MIT
+repository-code: "https://github.com/IliasSami/local-exact-match-domain-research"
+keywords:
+  - local-seo
+  - exact-match-domain
+  - emd
+  - domain-research
+  - domain-availability
+  - rdap
+  - seo
+  - ai-agents
+  - agent-skills
