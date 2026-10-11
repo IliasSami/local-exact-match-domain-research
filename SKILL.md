@@ -122,7 +122,10 @@ The orchestrator should use available capabilities where possible:
 - Trademark database search
 - Social-handle search
 - Business registry search
-- Spreadsheet/CSV creation
+- Spreadsheet/CSV creation and JSON output
+- Concurrency / bulk HTTP requests (for parallel RDAP availability checks)
+- Local script execution (the bundled Python tools, stdlib only)
+- Static HTML generation (for the self-contained availability dashboard)
 - Web crawling and structured-data validation
 - Geographic rank tracking or grid-rank tools, if available
 
@@ -1184,93 +1187,174 @@ Track:
 
 # Execution Playbook (verified, agentic)
 
-This is the concrete, repeatable pipeline validated by a live run. Follow it in
-order. It is optimized for parallel agents, low cost, and exact reproduction.
+This is the concrete, repeatable pipeline, validated by two independent live runs
+(UK tree removal; US dentists). It is a **two-stage pipeline**:
 
-## Step 1 — Normalize the service and geo terms
+- **Stage A — Data and availability.** Build the service × location × order
+  matrix, check every candidate against public RDAP, and cache to CSV **and**
+  JSON. Cheap and massively parallel; run it wide.
+- **Stage B — Score, verify, present.** Score only the available survivors, run
+  due diligence, and render a decision dashboard for a human.
 
-- Build the service lexicon from local search language, not generic/US terms.
-  UK example: `tree removal`, `tree surgeon`, `tree surgery`, `tree felling`,
-  `tree lopping`, `stump grinding`, `arborist`, `tree care`.
+Never score, rank or present anything until Stage A is complete, de-duplicated
+and free of non-definitive statuses.
+
+## Stage A — Data and availability
+
+### Step A1 — Normalize the service and location terms
+
+- Build the service lexicon from **local search language**, not generic terms.
+  - UK example: `tree removal`, `tree surgeon`, `tree surgery`, `tree felling`,
+    `tree lopping`, `stump grinding`, `arborist`, `tree care`.
+  - US example: `dentist`, `dental`, `orthodontist`, `cosmetic dentist`,
+    `emergency dentist`.
 - Normalize every term to a domain token: lowercase, no spaces, no hyphens.
-  Hyphens must be rejected per the Candidate Generation Constraints.
-- List the geo layers: country/ccTLD, region/metro, city, suburb.
-- Choose the ccTLD strategy before searching:
-  - `.co.uk` is the primary UK EMD asset.
-  - `.uk` is a second-level registration; registrants must hold the matching
-    `.co.uk` (Nominet rules). Check it, but treat it as a companion, not a
-    standalone buy.
-  - `.com` for global/brand head terms.
+  Hyphens are rejected by the Candidate Generation Constraints.
+- Build the location hierarchy explicitly and label every token with a
+  `geotype`. This label drives both the availability curve and the report.
 
-## Step 2 — Build the candidate matrix in tiers, then de-duplicate
+  | Layer | `geotype` | Examples (US / UK) |
+  |---|---|---|
+  | Country / ccTLD | *(implicit, via TLD)* | `.com`, `.co.uk`, `.uk` |
+  | State / region / county | `state` | `texas`, `california` |
+  | Metro / major city | `city` | `houston`, `phoenix` / `london`, `leeds` |
+  | Neighbourhood / district / popular place | `place` | `brooklyn`, `buckhead`, `soho` / `shoreditch` |
+  | Head term (no location) | `head` | `dentist.<tld>` |
 
-- Tier 1 head terms: `{service}.{tld}`
-- Tier 2 city EMDs: `{service}{city}.{tld}` and `{city}{service}.{tld}`
-- Tier 3 partial/hybrid: `{city}{service}pros.{tld}`, `{metro}{service}.{tld}`
-- De-duplicate on the exact domain string before any availability check.
+- Choose the ccTLD before searching:
+  - `.co.uk` is the primary UK EMD asset; `.uk` is a companion second-level
+    registration (Nominet requires the matching `.co.uk`), not a standalone buy.
+  - `.com` is the default for US and global head terms.
 
-## Step 3 — Check availability with public RDAP (no key, no cost)
+### Step A2 — Build the candidate matrix in tiers, then de-duplicate
 
-| Extension(s) | RDAP endpoint | 200 | 404 |
+- `head`: `{service}.{tld}`
+- `service+geo` and `geo+service`: `{service}{geo}.{tld}`, `{geo}{service}.{tld}`
+- Partial/hybrid: `{city}{service}pros.{tld}`, `{metro}{service}.{tld}`
+- Record every row with its metadata from the start — never as a bare domain
+  string: `domain, service, geo, geotype, order, status`.
+- De-duplicate on the **exact domain string** (names repeat across the `city`
+  and `place` layers) before any availability check.
+
+### Step A3 — Check availability with public RDAP (no key, no cost)
+
+| Extension(s) | RDAP endpoint | HTTP 200 | HTTP 404 |
 |---|---|---|---|
 | `.co.uk`, `.uk` | `https://rdap.nominet.uk/uk/domain/<domain>` | registered | available |
 | `.com` | `https://rdap.verisign.com/com/v1/domain/<domain>` | registered | available |
+| `.net` | `https://rdap.verisign.com/net/v1/domain/<domain>` | registered | available |
+| `.org` | `https://rdap.publicinterestregistry.org/rdap/domain/<domain>` | registered | available |
 
 - Treat `200` = registered and `404` = available as **definitive**.
-- Treat `429`, `503`, timeouts, and network errors as **non-definitive**.
-- Never decide on a non-definitive status. Collect statuses, then run a retry
-  pass over non-definitive rows only, with exponential backoff.
-- Concurrency: 4–6 workers. Higher rates trigger transient errors with little
-  time saved.
-- Fallback where RDAP is unavailable: `whois <domain>` and parse the response,
-  or a registrar availability API.
-- Cache every result to CSV. Reruns must only check new candidates.
-- A reusable implementation is provided at `assets/rdap_availability_check.py`.
+- Treat `429`, `503`, timeouts and network errors as **non-definitive**. Never
+  decide on a non-definitive status.
+- Collect statuses first, then run a **retry pass** over non-definitive rows
+  only, with exponential backoff. Across both live runs the retry pass resolved
+  every transient result — always include it.
+- **Concurrency: 4–6 workers; 5 is the sweet spot.** Measured throughput is
+  roughly 0.2 s/domain at 5 workers, so a 2,000-domain matrix takes ~6–7
+  minutes. Higher concurrency buys little and triggers transient errors.
+- Fallback where RDAP is unavailable: `whois <domain>`, or a registrar
+  availability API.
+- Cache every result to CSV. Reruns must only check new candidates (`--resume`).
 
-## Step 3.5 — Separate "available" from "good"
+### Step A4 — Emit machine-readable output (CSV + JSON)
 
-Availability is not quality. Do not stop at the availability list. Only
-available candidates proceed to scoring and due diligence.
+- Keep **one canonical CSV** as the evidence log.
+- Also emit a **JSON** with a `meta` block (title, services, type labels,
+  counts) and one record per candidate carrying `service_display` and
+  `geo_display` fields. The JSON feeds the report builder in Stage B.
 
-## Step 4 — Score the survivors only
+### Step A5 — Read the availability curve before scoring
 
-Apply Phase 3 (market), Phase 5 (local pack), Phase 6 (naming), and Phase 8
+Availability rises with **specificity** — the longer and more local the phrase,
+the more likely it is still free. Two independent runs show the same shape:
+
+| Layer | US dentists | UK tree removal |
+|---|---|---|
+| Head term | 0 / 18 (0%) | effectively 0% (two stragglers) |
+| City | 35 / 720 (5%) | 334 available |
+| State / region | 205 / 612 (33%) | n/a |
+| Neighbourhood / place | 268 / 600 (45%) | n/a |
+
+Interpretation:
+
+- **Do not spend due-diligence budget on head terms.** They are gone.
+- The exploitable layer is the **long tail**: `place` + service and second-tier
+  cities.
+- Do not dismiss neighbourhood EMDs as "too niche" without checking demand —
+  they are frequently the only genuinely available tier.
+- Availability is **not** quality (see Step B1).
+
+## Stage B — Score, verify, present
+
+### Step B1 — Separate "available" from "good"
+
+Availability is not quality. Only available candidates proceed to scoring.
+
+### Step B2 — Score the survivors only
+
+Apply Phase 3 (market), Phase 5 (local pack), Phase 6 (naming) and Phase 8
 (economics) to the available shortlist. Reject candidates that are:
 
 - low commercial intent (informational-only tokens),
 - geo/service mismatches the business cannot genuinely serve,
 - trademark-confusing or competitor-similar (Phase 7F).
 
-## Step 5 — Due diligence the shortlist (Phase 7)
+### Step B3 — Due diligence the shortlist (Phase 7)
 
-Run history, indexation, backlink, and trademark checks. Classify each as
+Run history, indexation, backlink and trademark checks. Classify each as
 clean / caution / reject before any purchase recommendation.
 
-## Step 6 — Report
+### Step B4 — Render a decision dashboard
 
-Produce the Required Deliverables below, plus the raw availability CSV as the
-evidence log.
+- Produce a **self-contained HTML dashboard** — no CDN, no build step, safe to
+  open offline or email. It should show: summary stat cards, availability by
+  service, availability by location type, a plain-language insight card, a
+  featured list of the strongest still-open tier, and a searchable/filterable
+  table of every candidate.
+- **Human-readable labels are not optional.** Concatenated tokens such as
+  `uppereastside` must be mapped to `Upper East Side` in the JSON
+  (`service_display`, `geo_display`). Never show raw tokens in a client-facing
+  report.
+- Ship it alongside the raw CSV as the evidence log.
 
 ## Efficiency rules
 
-- De-duplicate before checking; never re-check a cached domain.
+- De-duplicate before checking; never re-check a domain that has a cached
+  definitive status (use `--resume`).
 - Retry only non-definitive statuses, never definitive ones.
 - Two-phase cost model: bulk availability is cheap and parallel; scoring and
   due diligence are expensive and run only on survivors.
-- Keep one canonical CSV as the evidence log; derive all tables from it.
+- Keep one canonical CSV as the evidence log; derive every table and chart from
+  it, never by re-querying RDAP.
+- Prefer a labelled matrix (`geo,geotype,display`) over ad-hoc city lists, so
+  the same run can be re-scored, re-filtered and re-plotted without new checks.
 
-## Field notes from a live run (UK tree removal, 2026)
+## Bundled toolchain
 
-- 459 candidates checked via RDAP in about 3 minutes at 6 workers.
-- 339 available, 120 registered.
-- Every generic head term was registered except `treelopping` and
-  `treefellings` — so head-term EMDs were effectively unavailable.
-- The real opportunity was city EMDs: 334 available `.co.uk` city matches.
-- Token quality varied: `{city}treefelling`, `{city}treelopping`, and
-  `{city}treeremoval` are the strongest commercial EMDs; `arborist` availability
-  was high but commercial intent in the UK is lower.
-- Transient `URLError`/`429` occurred at concurrency 6. A retry pass over
-  non-definitive statuses resolved all of them — always include the retry pass.
+| Step | Tool | Output |
+|---|---|---|
+| A3–A4 | `assets/rdap_availability_check.py` | quick checks and simple service × city matrices → CSV |
+| A2–A4 | `assets/emd_matrix_run.py` | full multi-tier matrix (head/state/city/place, both orders, multi-TLD) → CSV + JSON, with `--resume` |
+| B4 | `assets/build_emd_report.py` | JSON → self-contained HTML dashboard |
+
+## Field notes from live runs (2026)
+
+**UK tree removal** — 459 candidates, 6 workers, ~3 minutes: 339 available,
+120 registered. Every generic head term was registered except `treelopping` and
+`treefellings`, so head-term EMDs were effectively unavailable. The real
+opportunity was city EMDs (334 available `.co.uk` matches). Token quality still
+varied: `{city}treefelling`, `{city}treelopping` and `{city}treeremoval` are the
+strongest commercial EMDs, while `arborist` availability was high but UK
+commercial intent is lower.
+
+**US dentists** — 1,950 candidates, 5 workers, ~6 minutes: 508 available,
+1,442 registered, **0 unresolved**. By location type: head 0%, city 5%,
+state 33%, place 45%. By service: emergency dentist 156, cosmetic dentist 119,
+orthodontist 99, dentists 60, dental 49, dentist 25. The dashboard made the
+finding — "the long tail is where the opportunity is" — readable in one screen;
+the raw CSV stayed the evidence log.
 
 ---
 
@@ -1351,6 +1435,15 @@ evidence:
   notes:
 ```
 
+### 10. Availability Dashboard and Data
+
+Alongside the written report, deliver:
+
+- the **canonical CSV** (every candidate with `domain, service, geo, geotype,
+  order, status`) as the evidence log, and
+- a **self-contained HTML dashboard** built from the JSON (Step B4), with
+  human-readable `service_display` / `geo_display` labels — never raw tokens.
+
 ---
 
 # Quality-Control Checklist
@@ -1368,6 +1461,8 @@ Before presenting recommendations, Agent H must verify:
 - [ ] Domain history and backlink risks were checked or limitations disclosed.
 - [ ] The financial recommendation is conservative.
 - [ ] The plan does not use fake locations, fake profiles, deceptive reviews, or doorway pages.
+- [ ] Availability is reported only for definitive statuses (no non-definitive rows presented as facts).
+- [ ] The dashboard shows human-readable labels, and the canonical CSV is shipped as the evidence log.
 - [ ] All data points have sources, dates, or confidence labels.
 - [ ] The recommendation identifies a no-buy option when evidence is weak.
 

@@ -56,8 +56,15 @@ prominence** — not around the myth that a keyword domain guarantees rankings.
   analysis, domain discovery, risk/history, implementation, and QA roles.
 - **Scoring models** — Market Opportunity Score (0–30), Local Entity Opportunity
   Score (0–30), Domain Candidate Score (0–35), with explicit decision thresholds.
-- **Live availability checks** — public RDAP endpoints (Nominet, Verisign, PIR), no API
-  key, with a definitive/transient status model and an automatic retry pass.
+- **Live availability checks** — public RDAP endpoints for `.co.uk`/`.uk` (Nominet),
+  `.com`/`.net` (Verisign) and `.org` (PIR), no API key, with a
+  definitive/transient status model, an automatic retry pass and `--resume` caching.
+- **Two-stage pipeline** — bulk availability produces a canonical CSV **and** a
+  structured JSON; scoring and due diligence then run only on the survivors.
+- **Multi-tier geography** — head term → state/region → city → neighbourhood/place,
+  every token labelled with a `geotype`, so the availability curve is explicit.
+- **Visual availability dashboard** — a bundled builder turns the run JSON into a
+  self-contained, offline HTML report (stat cards, charts, insight, searchable table).
 - **Due diligence** — WHOIS/RDAP, archive history, indexation, backlink profile,
   trademark/naming safety, classified clean / caution / reject.
 - **Financial model** — payback range and risk-adjusted expected value, not guarantees.
@@ -100,31 +107,42 @@ Then ask your agent to use the **`local-exact-match-domain-research`** skill.
 3. Maps the service and geo layers and scores market quality.
 4. Analyses organic SERPs and the local pack separately.
 5. Generates EMD / PMD / hybrid / brandable candidates in tiers.
-6. Checks availability with the bundled RDAP script.
+6. Checks availability at scale with the bundled RDAP tools (canonical CSV + JSON).
 7. Scores and performs due diligence on the **available** shortlist only.
-8. Returns a decision-ready report and a 90-day launch plan.
+8. Returns a decision-ready report, a self-contained HTML availability dashboard,
+   and a 90-day launch plan.
 
 ## The verified execution playbook
 
+The skill ships a three-tool toolchain: **matrix runner → report builder**, with a
+lightweight quick-checker for one-off jobs.
+
 ```bash
-# one-off availability check
+# 1. quick one-off checks
 python3 assets/rdap_availability_check.py treeremovallondon.co.uk treesurgeon.co.uk
 
-# generate a service x city x tld matrix and check it
-python3 assets/rdap_availability_check.py \
-  --service treeremoval treesurgeon treefelling \
-  --city london manchester leeds birmingham \
-  --tld co.uk \
-  --out results.csv
+# 2. full multi-tier research run -> CSV + JSON (head/state/city/place, both orders)
+#    geo.csv columns: geo,geotype,display  (e.g. texas,state,Texas)
+python3 assets/emd_matrix_run.py \
+  --service dentist dentists dental orthodontist \
+  --geo-file geo.csv --tld com \
+  --out-csv availability.csv --json-out data.json \
+  --title "US dentist EMD research"
+
+# 3. build the self-contained HTML dashboard from the JSON
+python3 assets/build_emd_report.py --input data.json --out report.html --highlight-type city
 ```
 
-Status model: `HTTP 200 = registered`, `HTTP 404 = available`, transient results
-(`429/503/timeout`) are automatically retried. Availability is **not** quality — only
+Status model: `HTTP 200 = registered`, `HTTP 404 = available`; transient results
+(`429/503/timeout`) are retried with backoff, and `--resume` skips domains that
+already have a definitive cached status. Availability is **not** quality — only
 survivors go to scoring and due diligence.
 
-## Worked example
+## Worked examples
 
-A live run for **UK tree removal** (459 candidates, 6 workers, ~3 minutes):
+Two independent live runs, both showing the same availability curve.
+
+**UK tree removal** (459 candidates, 6 workers, ~3 minutes):
 
 | Metric | Result |
 |---|---|
@@ -134,9 +152,25 @@ A live run for **UK tree removal** (459 candidates, 6 workers, ~3 minutes):
 | Available `.co.uk` city EMDs | **334** |
 
 Every generic head term was already registered except `treelopping.co.uk` and
-`treefellings.co.uk`. The exploitable layer was **city + service** EMDs. Full data:
-[`examples/uk-tree-removal-live-run.md`](examples/uk-tree-removal-live-run.md) and
-[`examples/uk-treeremoval-availability.csv`](examples/uk-treeremoval-availability.csv).
+`treefellings.co.uk`; the exploitable layer was **city + service**.
+
+**US dentists** (1,950 candidates, 5 workers, ~6 minutes, 0 unresolved):
+
+| Layer | Available | Total | Open |
+|---|---:|---:|---:|
+| Head term | 0 | 18 | 0% |
+| City | 35 | 720 | 5% |
+| State | 205 | 612 | 33% |
+| Neighbourhood / place | 268 | 600 | 45% |
+
+Availability rises with **specificity** — the long tail is where the opportunity
+is. Write-ups and evidence:
+[`examples/uk-tree-removal-live-run.md`](examples/uk-tree-removal-live-run.md),
+[`examples/uk-treeremoval-availability.csv`](examples/uk-treeremoval-availability.csv),
+[`examples/us-dentist-live-run.md`](examples/us-dentist-live-run.md),
+[`examples/us-dentist-availability.csv`](examples/us-dentist-availability.csv), and a
+rendered dashboard at
+[`examples/us-dentist-report.html`](examples/us-dentist-report.html).
 
 ## What's inside
 
@@ -144,10 +178,15 @@ Every generic head term was already registered except `treelopping.co.uk` and
 local-exact-match-domain-research/
 ├── SKILL.md                                  # full skill (phases + verified playbook)
 ├── assets/
-│   └── rdap_availability_check.py            # reusable RDAP availability checker
+│   ├── rdap_availability_check.py            # quick RDAP checks / simple matrices
+│   ├── emd_matrix_run.py                     # multi-tier matrix -> CSV + JSON (+ --resume)
+│   └── build_emd_report.py                   # JSON -> self-contained HTML dashboard
 └── examples/
-    ├── uk-tree-removal-live-run.md           # worked example write-up
-    └── uk-treeremoval-availability.csv       # raw availability evidence
+    ├── uk-tree-removal-live-run.md           # worked example write-up (UK)
+    ├── uk-treeremoval-availability.csv       # raw availability evidence (UK)
+    ├── us-dentist-live-run.md                # worked example write-up (US)
+    ├── us-dentist-availability.csv           # raw availability evidence (US)
+    └── us-dentist-report.html                # rendered HTML dashboard (US)
 ```
 
 ## Guardrails — what this skill will NOT do
@@ -183,10 +222,11 @@ launch budget on a domain before funding real operations, content and reviews.
 ## Keywords
 
 local SEO · exact match domain · EMD · PMD · partial match domain · domain research ·
-domain availability · RDAP · WHOIS · SERP analysis · local pack · Google Business
-Profile · local SEO skill · SEO skill for AI agents · Claude skill · Claude Code skills ·
-agent skills · Codex skill · OpenCode skill · lead generation · service-area business ·
-entity SEO
+domain availability · bulk domain availability · bulk RDAP check · RDAP · WHOIS ·
+domain availability dashboard · HTML domain report · geo matrix · neighbourhood EMD ·
+hyperlocal domain · SERP analysis · local pack · Google Business Profile · local SEO
+skill · SEO skill for AI agents · Claude skill · Claude Code skills · agent skills ·
+Codex skill · OpenCode skill · lead generation · service-area business · entity SEO
 
 ## Disclaimer
 
